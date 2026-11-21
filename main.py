@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""The Catalogue Photo of an Impossible Gadget.
+"""TOASTAPHONE - catalogue photo of an impossible gadget.
 
-Renders, with the Python standard library only, a studio catalogue photograph
-of a chrome two-slot toaster toasting a smartphone, with a single butter knife
-as the one accessory. Writes /output/entry.png (1024x1024, deterministic).
+Pure-stdlib procedural renderer. Writes /output/entry.png (1024x1024).
+Deterministic: fixed constants only, no clock, no unseeded randomness.
 """
 import math
 import os
@@ -11,403 +10,353 @@ import struct
 import zlib
 
 W = H = 1024
+OUT = "/output/entry.png"
+
+fb = bytearray(W * H * 3)
 
 
-# ---------------------------------------------------------------- canvas
-class Canvas:
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.rows = [bytearray(w * 3) for _ in range(h)]
-
-    def set(self, x, y, r, g, b):
-        if 0 <= x < self.w and 0 <= y < self.h:
-            row = self.rows[y]
-            i = x * 3
-            row[i] = r
-            row[i + 1] = g
-            row[i + 2] = b
-
-    def blend(self, x, y, r, g, b, a):
-        """Blend colour over pixel (x, y); a in 0..255."""
-        if a <= 0 or not (0 <= x < self.w and 0 <= y < self.h):
-            return
-        row = self.rows[y]
-        i = x * 3
-        if a >= 255:
-            row[i] = r
-            row[i + 1] = g
-            row[i + 2] = b
-            return
-        inv = 255 - a
-        row[i] = (r * a + row[i] * inv) // 255
-        row[i + 1] = (g * a + row[i + 1] * inv) // 255
-        row[i + 2] = (b * a + row[i + 2] * inv) // 255
-
-    def fill_row(self, y, x0, x1, r, g, b):
-        if y < 0 or y >= self.h:
-            return
-        x0 = max(0, x0)
-        x1 = min(self.w, x1)
-        if x1 <= x0:
-            return
-        row = self.rows[y]
-        row[x0 * 3:x1 * 3] = bytes((r, g, b)) * (x1 - x0)
-
-    def fill_row_dithered(self, y, x0, x1, r, g, b):
-        """Fill a row span with 4x4 Bayer dither varying per pixel (no banding)."""
-        if y < 0 or y >= self.h:
-            return
-        x0 = max(0, x0)
-        x1 = min(self.w, x1)
-        if x1 <= x0:
-            return
-        row = self.rows[y]
-        brow = BAYER[y & 3]
-        for p in range(4):
-            xs = x0 + ((p - x0) & 3)
-            if xs >= x1:
-                continue
-            cnt = (x1 - 1 - xs) // 4 + 1
-            off = (brow[p] - 8) * 0.9
-            rr, gg, bb = clamp(r + off), clamp(g + off), clamp(b + off)
-            for ch, val in ((0, rr), (1, gg), (2, bb)):
-                row[xs * 3 + ch:xs * 3 + ch + cnt * 12:12] = bytes([val]) * cnt
-
-    def blend_row(self, y, x0, x1, r, g, b, a):
-        if y < 0 or y >= self.h or a <= 0:
-            return
-        x0 = max(0, x0)
-        x1 = min(self.w, x1)
-        for x in range(x0, x1):
-            self.blend(x, y, r, g, b, a)
-
-
-def clamp(v, lo=0, hi=255):
-    return lo if v < lo else hi if v > hi else int(v)
+def blend(x, y, r, g, b, a):
+    if 0 <= x < W and 0 <= y < H and a > 0.0:
+        i = (y * W + x) * 3
+        if a >= 1.0:
+            fb[i] = r
+            fb[i + 1] = g
+            fb[i + 2] = b
+        else:
+            ia = 1.0 - a
+            fb[i] = int(fb[i] * ia + r * a + 0.5)
+            fb[i + 1] = int(fb[i + 1] * ia + g * a + 0.5)
+            fb[i + 2] = int(fb[i + 2] * ia + b * a + 0.5)
 
 
 def lerp(a, b, t):
     return a + (b - a) * t
 
 
-def grad(stops, t):
-    """stops: list of (pos, (r,g,b)); t in 0..1 -> (r,g,b)."""
+def lerp3(c1, c2, t):
+    return (int(lerp(c1[0], c2[0], t) + 0.5),
+            int(lerp(c1[1], c2[1], t) + 0.5),
+            int(lerp(c1[2], c2[2], t) + 0.5))
+
+
+def vgrad(stops, t):
     if t <= stops[0][0]:
         return stops[0][1]
     for i in range(1, len(stops)):
-        p0, c0 = stops[i - 1]
-        p1, c1 = stops[i]
-        if t <= p1:
-            f = (t - p0) / (p1 - p0) if p1 > p0 else 0.0
-            return (lerp(c0[0], c1[0], f), lerp(c0[1], c1[1], f),
-                    lerp(c0[2], c1[2], f))
+        if t <= stops[i][0]:
+            t0, c0 = stops[i - 1]
+            t1, c1 = stops[i]
+            f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+            return lerp3(c0, c1, f)
     return stops[-1][1]
 
 
-# BAYER 4x4 dither (deterministic, kills banding on smooth gradients)
-BAYER = ((0, 8, 2, 10), (12, 4, 14, 6), (3, 11, 1, 9), (15, 7, 13, 5))
-
-
-def dither(x, y):
-    return (BAYER[y & 3][x & 3] - 8) * 0.9
-
-
-# ---------------------------------------------------------------- shapes
-def rounded_span(x0, x1, y, cy0, cy1, r):
-    """Horizontal span of a rounded rect on scanline y, or None."""
-    if y < cy0 or y >= cy1:
-        return None
-    lo, hi = x0, x1
-    if y < cy0 + r:
-        dy = cy0 + r - y
-        dx = int(math.sqrt(max(0, r * r - dy * dy)))
-        lo = max(lo, x0 + r - dx)
-        hi = min(hi, x1 - r + dx)
-    elif y >= cy1 - r:
-        dy = y - (cy1 - r) + 1
-        dx = int(math.sqrt(max(0, r * r - dy * dy)))
-        lo = max(lo, x0 + r - dx)
-        hi = min(hi, x1 - r + dx)
-    return (lo, hi) if hi > lo else None
-
-
-def vgrad_rrect(cv, x0, y0, x1, y1, r, stops, sheen=None):
-    """Rounded rect filled with a vertical gradient. sheen: optional
-    callable (x, y) -> extra brightness 0..1 added as white."""
+def fill_rect(x0, y0, x1, y1, col, a=1.0):
+    x0 = max(0, int(x0))
+    y0 = max(0, int(y0))
+    x1 = min(W, int(x1))
+    y1 = min(H, int(y1))
+    r, g, b = col
     for y in range(y0, y1):
-        sp = rounded_span(x0, x1, y, y0, y1, r)
-        if not sp:
-            continue
-        t = (y - y0) / max(1, y1 - y0)
-        cr, cg, cb = grad(stops, t)
-        cv.fill_row_dithered(y, sp[0], sp[1], cr, cg, cb)
-        if sheen is not None:
-            for x in range(sp[0], sp[1]):
-                s = sheen(x, y)
-                if s > 0.02:
-                    cv.blend(x, y, 255, 255, 255, int(255 * min(0.55, s)))
+        base = y * W * 3
+        for x in range(x0, x1):
+            i = base + x * 3
+            if a >= 1.0:
+                fb[i] = r
+                fb[i + 1] = g
+                fb[i + 2] = b
+            else:
+                ia = 1.0 - a
+                fb[i] = int(fb[i] * ia + r * a + 0.5)
+                fb[i + 1] = int(fb[i + 1] * ia + g * a + 0.5)
+                fb[i + 2] = int(fb[i + 2] * ia + b * a + 0.5)
 
 
-def ellipse(cv, cx, cy, rx, ry, color, peak_alpha, soft=1.0):
-    """Soft filled ellipse; alpha falls off smoothly to zero at the edge."""
-    r, g, b = color
-    x0, x1 = int(cx - rx * soft), int(cx + rx * soft)
-    y0, y1 = int(cy - ry * soft), int(cy + ry * soft)
-    for y in range(max(0, y0), min(cv.h, y1)):
-        ny = (y - cy) / (ry * soft)
-        for x in range(max(0, x0), min(cv.w, x1)):
-            nx = (x - cx) / (rx * soft)
-            d2 = nx * nx + ny * ny
-            if d2 >= 1.0:
-                continue
-            fall = 1.0 - d2
-            a = int(peak_alpha * fall * fall)
-            if a > 0:
-                cv.blend(x, y, r, g, b, a)
+def rounded_rect(x0, y0, x1, y1, r, color_fn):
+    x0i = max(0, int(x0))
+    y0i = max(0, int(y0))
+    x1i = min(W, int(x1))
+    y1i = min(H, int(y1))
+    cx0, cy0 = x0 + r, y0 + r
+    cx1, cy1 = x1 - r, y1 - r
+    r2 = r * r
+    for y in range(y0i, y1i):
+        for x in range(x0i, x1i):
+            dx = 0.0
+            if x < cx0:
+                dx = cx0 - x
+            elif x > cx1:
+                dx = x - cx1
+            dy = 0.0
+            if y < cy0:
+                dy = cy0 - y
+            elif y > cy1:
+                dy = y - cy1
+            if dx * dx + dy * dy <= r2:
+                c = color_fn(x, y)
+                if c is not None:
+                    blend(x, y, c[0], c[1], c[2], c[3])
 
 
-def disc(cv, cx, cy, rad, color, alpha=255):
-    ellipse(cv, cx, cy, rad, rad, color, alpha, soft=1.0)
-
-
-def ring(cv, cx, cy, r_out, r_in, color, alpha=255):
-    r, g, b = color
-    for y in range(int(cy - r_out), int(cy + r_out) + 1):
-        for x in range(int(cx - r_out), int(cx + r_out) + 1):
-            d = math.hypot(x - cx, y - cy)
-            if r_in <= d <= r_out:
-                cv.blend(x, y, r, g, b, alpha)
-
-
-def hline(cv, x0, x1, y, color, alpha=255):
-    r, g, b = color
-    for x in range(x0, x1):
-        cv.blend(x, y, r, g, b, alpha)
-
-
-def vline(cv, x, y0, y1, color, alpha=255):
-    r, g, b = color
+def ellipse(cx, cy, rx, ry, col, a):
+    x0 = max(0, int(cx - rx))
+    x1 = min(W, int(cx + rx) + 1)
+    y0 = max(0, int(cy - ry))
+    y1 = min(H, int(cy + ry) + 1)
     for y in range(y0, y1):
-        cv.blend(x, y, r, g, b, alpha)
+        t = (y - cy) / ry
+        dx = rx * math.sqrt(max(0.0, 1.0 - t * t))
+        xa = max(x0, int(cx - dx))
+        xb = min(x1, int(cx + dx) + 1)
+        for x in range(xa, xb):
+            blend(x, y, col[0], col[1], col[2], a)
 
 
-# ---------------------------------------------------------------- 5x7 font
+def disc(cx, cy, r, col, a=1.0):
+    ellipse(cx, cy, r, r, col, a)
+
+
+def polygon(points, col, a=1.0):
+    ys = [p[1] for p in points]
+    y0 = max(0, int(min(ys)))
+    y1 = min(H, int(max(ys)) + 1)
+    n = len(points)
+    for y in range(y0, y1):
+        xs = []
+        for i in range(n):
+            x1, y1p = points[i]
+            x2, y2p = points[(i + 1) % n]
+            if (y1p <= y < y2p) or (y2p <= y < y1p):
+                t = (y - y1p) / (y2p - y1p)
+                xs.append(x1 + t * (x2 - x1))
+        if len(xs) >= 2:
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                xa = max(0, int(xs[k]))
+                xb = min(W, int(xs[k + 1]) + 1)
+                for x in range(xa, xb):
+                    blend(x, y, col[0], col[1], col[2], a)
+
+
+def line(x0, y0, x1, y1, col, a=1.0, width=1):
+    steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+    for s in range(steps + 1):
+        t = s / max(1, steps)
+        x = int(x0 + (x1 - x0) * t)
+        y = int(y0 + (y1 - y0) * t)
+        for wy in range(-(width // 2), width // 2 + 1):
+            for wx in range(-(width // 2), width // 2 + 1):
+                blend(x + wx, y + wy, col[0], col[1], col[2], a)
+
+
 FONT = {
-    'A': ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
-    'E': ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
-    'H': ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
-    'N': ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
-    'O': ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
-    'P': ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
-    'S': ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
-    'T': ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    'T': ["#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.."],
+    'O': [".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."],
+    'A': [".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    'S': [".####", "#....", "#....", ".###.", "....#", "....#", "####."],
+    'P': ["####.", "#...#", "#...#", "####.", "#....", "#....", "#...."],
+    'H': ["#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"],
+    'N': ["#...#", "##..#", "##..#", "#.#.#", "#..##", "#..##", "#...#"],
+    'E': ["#####", "#....", "#....", "####.", "#....", "#....", "#####"],
 }
 
 
-def draw_text(cv, text, x, y, scale, color):
+def draw_text(s, x, y, scale, col, spacing=3):
     cx = x
-    for ch in text:
-        glyph = FONT.get(ch)
-        if glyph is None:
-            cx += 6 * scale
+    for ch in s:
+        g = FONT.get(ch)
+        if g is None:
+            cx += 5 * scale + spacing
             continue
-        for gy, row in enumerate(glyph):
-            for gx, bit in enumerate(row):
-                if bit == '1':
-                    for dy in range(scale):
-                        for dx in range(scale):
-                            cv.set(cx + gx * scale + dx, y + gy * scale + dy,
-                                   *color)
-        cx += 6 * scale
-    return cx - x
+        for r in range(7):
+            row = g[r]
+            for c in range(5):
+                if row[c] == '#':
+                    fill_rect(cx + c * scale, y + r * scale,
+                              cx + c * scale + scale, y + r * scale + scale, col)
+        cx += 5 * scale + spacing
 
 
-# ---------------------------------------------------------------- scene
+def chrome_fn(x, y):
+    t = (y - 440) / 340.0
+    base = vgrad([(0.0, (233, 234, 237)), (0.35, (204, 207, 212)),
+                  (0.70, (169, 173, 180)), (1.0, (134, 139, 147))], t)
+    sheen = math.exp(-((x - 335) ** 2) / (2 * 70.0 ** 2)) * 0.38
+    dark = 0.0
+    if x > 700:
+        dark = (x - 700) / 74.0 * 0.18
+    r = min(255, int(base[0] * (1.0 - dark) + 255 * sheen))
+    g = min(255, int(base[1] * (1.0 - dark) + 255 * sheen))
+    b = min(255, int(base[2] * (1.0 - dark) + 255 * sheen))
+    return (r, g, b, 1.0)
+
+
+def plate_fn(x, y):
+    t = (y - 408) / 40.0
+    base = vgrad([(0.0, (118, 122, 130)), (1.0, (88, 91, 99))], t)
+    sheen = math.exp(-((x - 360) ** 2) / (2 * 90.0 ** 2)) * 0.25
+    return (min(255, int(base[0] + 255 * sheen)),
+            min(255, int(base[1] + 255 * sheen)),
+            min(255, int(base[2] + 255 * sheen)), 1.0)
+
+
+def bezel_fn(x, y):
+    t = (y - 128) / 320.0
+    base = vgrad([(0.0, (54, 56, 62)), (0.5, (32, 34, 40)),
+                  (1.0, (22, 23, 27))], t)
+    if y < 190:
+        f = (190 - y) / 62.0 * 0.70
+        base = lerp3(base, (122, 74, 32), f)
+    return (base[0], base[1], base[2], 1.0)
+
+
+def screen_fn(x, y):
+    t = (y - 142) / 306.0
+    base = vgrad([(0.0, (255, 196, 90)), (0.5, (255, 140, 50)),
+                  (1.0, (232, 84, 28))], t)
+    if y < 200:
+        tb = (y - 142) / 58.0
+        base = lerp3((110, 62, 26), base, tb)
+    d = (x - 352) - (y - 142) * 0.55
+    if 30 < d < 82:
+        base = lerp3(base, (255, 255, 255), 0.16)
+    return (base[0], base[1], base[2], 1.0)
+
+
+def solid(col):
+    return lambda x, y: (col[0], col[1], col[2], 1.0)
+
+
 def render():
-    cv = Canvas(W, H)
-
-    # --- seamless studio backdrop: warm off-white vertical gradient
-    bg = [(0.0, (250, 248, 245)), (0.55, (240, 236, 231)),
-          (0.82, (228, 223, 216)), (1.0, (214, 208, 200))]
+    # 1. Studio backdrop: warm light-grey vertical gradient + soft vignette.
+    top = (243, 241, 235)
+    bot = (213, 208, 199)
     for y in range(H):
-        cr, cg, cb = grad(bg, y / (H - 1))
-        cv.fill_row_dithered(y, 0, W, cr, cg, cb)
+        t = y / (H - 1)
+        base = lerp3(top, bot, t)
+        row = y * W * 3
+        dy = y - 420
+        for x in range(W):
+            dx = x - 512
+            d2 = dx * dx + dy * dy
+            f = 1.0 - 0.045 * d2 / (950.0 * 950.0)
+            fb[row + x * 3] = int(base[0] * f + 0.5)
+            fb[row + x * 3 + 1] = int(base[1] * f + 0.5)
+            fb[row + x * 3 + 2] = int(base[2] * f + 0.5)
 
-    # soft centre glow behind the product
-    ellipse(cv, 512, 520, 430, 400, (255, 255, 255), 46, soft=1.0)
+    # 2. Floor band + horizon line.
+    fill_rect(0, 780, W, H, (205, 199, 188), 0.6)
+    fill_rect(0, 779, W, 782, (180, 174, 164), 0.25)
 
-    # --- floor shadows (soft, layered)
-    ellipse(cv, 512, 838, 330, 46, (60, 52, 44), 96, soft=1.0)
-    ellipse(cv, 512, 838, 250, 34, (60, 52, 44), 80, soft=1.0)
-    ellipse(cv, 865, 894, 140, 16, (60, 52, 44), 70, soft=1.0)
+    # 3. Warm heat glow behind the phone (subtle, wide).
+    ellipse(425, 230, 200, 150, (255, 150, 60), 0.05)
 
-    # --- warm glow above the toasting phone (heat)
-    ellipse(cv, 630, 250, 150, 120, (255, 166, 66), 42, soft=1.0)
+    # 4. Soft floor shadows.
+    ellipse(512, 798, 340, 40, (40, 36, 30), 0.20)
+    ellipse(512, 796, 300, 32, (40, 36, 30), 0.22)
+    ellipse(512, 794, 250, 24, (40, 36, 30), 0.22)
+    ellipse(512, 783, 290, 14, (40, 36, 30), 0.28)
+    ellipse(895, 862, 110, 11, (40, 36, 30), 0.20)
 
-    # --- smartphone rising out of the right slot (drawn before toaster body
-    #     so the body hides its lower end, as if inside the slot)
-    ph_x0, ph_y0, ph_x1, ph_y1 = 566, 168, 706, 430
-    # bezel
-    vgrad_rrect(cv, ph_x0, ph_y0, ph_x1, ph_y1, 22,
-                [(0.0, (38, 40, 46)), (1.0, (12, 13, 16))])
-    # screen: hot amber, toasted darker towards the top edge
-    scr = [(0.0, (146, 74, 22)), (0.18, (214, 110, 30)),
-           (0.45, (255, 176, 72)), (0.75, (255, 205, 110)),
-           (1.0, (255, 224, 150))]
-    vgrad_rrect(cv, ph_x0 + 10, ph_y0 + 12, ph_x1 - 10, ph_y1 - 8, 16, scr)
-    # toasted crust: irregular brown scorch along the top of the screen
-    ellipse(cv, 600, ph_y0 + 16, 34, 12, (96, 52, 16), 150, soft=1.0)
-    ellipse(cv, 660, ph_y0 + 14, 40, 13, (120, 66, 20), 150, soft=1.0)
-    ellipse(cv, 636, ph_y0 + 10, 26, 9, (70, 38, 12), 170, soft=1.0)
-    # screen glare
-    for y in range(ph_y0 + 20, ph_y1 - 20):
-        t = (y - ph_y0) / (ph_y1 - ph_y0)
-        x0 = ph_x0 + 22 + int(26 * t)
-        x1 = x0 + 16
-        cv.blend_row(y, x0, x1, 255, 255, 255, 26)
-    # app icons on the glowing screen (a toaster app, a clock, a flame)
-    icon_cols = [(255, 244, 214), (214, 236, 255), (255, 214, 190),
-                 (226, 255, 214), (255, 226, 240), (240, 226, 255)]
+    # 5. Butter knife (the one accessory), lying on the floor, right side.
+    # Bigger and clearer: wide steel blade, dark wooden handle.
+    polygon([(862, 830), (985, 800), (998, 812), (872, 844)], (198, 201, 207))
+    polygon([(866, 832), (982, 803), (990, 809), (872, 840)], (238, 240, 243), 0.7)
+    polygon([(790, 842), (862, 828), (868, 842), (796, 858)], (88, 60, 38))
+    polygon([(796, 844), (860, 830), (864, 838), (800, 854)], (122, 86, 54), 0.8)
+
+    # 6. Toaster body, chrome.
+    rounded_rect(250, 440, 774, 780, 28, chrome_fn)
+    fill_rect(252, 450, 258, 772, (255, 255, 255), 0.30)
+    fill_rect(766, 450, 772, 772, (70, 74, 80), 0.25)
+
+    # 7. Top plate + slots.
+    rounded_rect(262, 408, 762, 448, 14, plate_fn)
+    rounded_rect(330, 414, 520, 442, 8, solid((16, 18, 20)))
+    rounded_rect(560, 414, 700, 442, 8, solid((16, 18, 20)))
+
+    # 8. Smartphone rising out of the left slot, mid-toast.
+    rounded_rect(340, 128, 510, 448, 18, bezel_fn)
+    rounded_rect(352, 142, 498, 448, 12, screen_fn)
+    # Notch.
+    rounded_rect(408, 146, 442, 160, 6, solid((30, 32, 36)))
+    # App icons, 3 x 4 grid, still alive on the hot screen.
+    icon_cols = [(255, 255, 255), (120, 200, 255), (255, 210, 90),
+                 (140, 230, 160), (255, 150, 180), (190, 160, 255),
+                 (255, 240, 200), (110, 220, 210), (255, 190, 120),
+                 (200, 220, 255), (180, 255, 190), (255, 170, 150)]
     k = 0
-    for row_i in range(2):
-        for col_i in range(3):
-            ix = ph_x0 + 26 + col_i * 38
-            iy = ph_y0 + 96 + row_i * 40
-            vgrad_rrect(cv, ix, iy, ix + 28, iy + 28, 7,
-                        [(0.0, icon_cols[k]), (1.0, (255, 255, 255))])
+    for row in range(4):
+        for col in range(3):
+            ix = 366 + col * 44
+            iy = 200 + row * 44
+            rounded_rect(ix, iy, ix + 28, iy + 28, 7, solid(icon_cols[k]))
+            disc(ix + 14, iy + 14, 4, (255, 255, 255), 0.8)
             k += 1
-    # home indicator
-    hline(cv, ph_x0 + 52, ph_x1 - 52, ph_y1 - 22, (255, 255, 255), 200)
-    hline(cv, ph_x0 + 52, ph_x1 - 52, ph_y1 - 21, (255, 255, 255), 120)
+    # Dock bar.
+    rounded_rect(366, 400, 484, 428, 10, solid((255, 255, 255)))
 
-    # --- toaster body: brushed chrome, rounded, hero-centred
-    bx0, by0, bx1, by1 = 252, 382, 774, 802
-    chrome = [(0.0, (233, 236, 239)), (0.16, (205, 210, 215)),
-              (0.38, (168, 174, 181)), (0.55, (196, 201, 206)),
-              (0.72, (226, 229, 232)), (0.88, (178, 184, 190)),
-              (1.0, (140, 146, 152))]
+    # 9. Lever on the right side.
+    rounded_rect(770, 590, 806, 612, 6, solid((200, 203, 208)))
+    disc(810, 601, 10, (40, 42, 46))
+    disc(807, 598, 3, (120, 124, 130), 0.8)
 
-    def sheen(x, y):
-        # soft diagonal studio streak across the chrome
-        s = 1.0 - abs((x - y * 0.55 - 330) / 90.0)
-        return max(0.0, s) * 0.5
+    # 10. Browning dial, set to extra toasted.
+    disc(655, 622, 46, (58, 60, 64))
+    disc(655, 622, 41, (246, 243, 237))
+    for ang in (150, 105, 60, 15, -30):
+        rad = math.radians(ang)
+        x1 = 655 + math.cos(rad) * 30
+        y1 = 622 - math.sin(rad) * 30
+        x2 = 655 + math.cos(rad) * 37
+        y2 = 622 - math.sin(rad) * 37
+        line(x1, y1, x2, y2, (70, 72, 76), 1.0, 2)
+    prad = math.radians(15)
+    line(655, 622, 655 + math.cos(prad) * 28, 622 - math.sin(prad) * 28,
+         (200, 60, 30), 1.0, 3)
+    disc(655, 622, 6, (60, 62, 66))
 
-    vgrad_rrect(cv, bx0, by0, bx1, by1, 46, chrome, sheen=sheen)
-    # left edge highlight + right edge shade (cylindrical read)
-    for y in range(by0 + 30, by1 - 30):
-        cv.blend_row(y, bx0 + 6, bx0 + 26, 255, 255, 255, 60)
-        cv.blend_row(y, bx1 - 30, bx1 - 8, 40, 44, 50, 46)
-    # bottom plinth
-    vgrad_rrect(cv, bx0 + 14, by1 - 34, bx1 - 14, by1 + 2, 14,
-                [(0.0, (96, 100, 106)), (1.0, (58, 62, 68))])
-    # top plate (slightly darker brushed steel)
-    vgrad_rrect(cv, bx0 + 4, by0, bx1 - 4, by0 + 34, 30,
-                [(0.0, (196, 200, 205)), (1.0, (150, 156, 162))])
-    # slots: left empty, right holds the phone
-    vgrad_rrect(cv, 322, by0 + 10, 452, by0 + 26, 8,
-                [(0.0, (20, 20, 22)), (1.0, (52, 52, 56))])
-    vgrad_rrect(cv, 576, by0 + 10, 696, by0 + 26, 8,
-                [(0.0, (16, 16, 18)), (1.0, (44, 44, 48))])
-    # slot rims catch the light
-    hline(cv, 322, 452, by0 + 9, (240, 242, 244), 160)
-    hline(cv, 576, 696, by0 + 9, (240, 242, 244), 160)
+    # 11. Brand + dial label.
+    draw_text("TOASTAPHONE", 415, 500, 3, (58, 60, 65))
+    draw_text("TOAST", 639, 678, 1, (90, 92, 96))
 
-    # --- brand + model line on the body
-    draw_text(cv, "TOASTAPHONE", 512 - 99, 556, 3, (52, 56, 62))
-    draw_text(cv, "PHONE", 512 - 45, 596, 2, (96, 100, 106))
-    draw_text(cv, "TOASTER", 512 - 35, 614, 2, (96, 100, 106))
-    hline(cv, 452, 572, 588, (120, 124, 130), 120)
-
-    # --- browning dial
-    disc(cv, 360, 690, 46, (228, 231, 234), 255)
-    ring(cv, 360, 690, 46, 41, (120, 126, 132), 255)
-    disc(cv, 360, 690, 34, (178, 184, 190), 255)
-    disc(cv, 360, 690, 30, (206, 210, 214), 255)
-    for i in range(7):
-        ang = math.pi * (0.75 + i * 0.25 / 3.0 * 2.0 / 2.0)  # ticks arc
-        # ticks from 135deg to 405deg
-        a = math.radians(135 + i * 45)
-        x0 = 360 + int(38 * math.cos(a))
-        y0 = 690 + int(38 * math.sin(a))
-        x1 = 360 + int(44 * math.cos(a))
-        y1 = 690 + int(44 * math.sin(a))
-        for t in range(9):
-            xx = int(lerp(x0, x1, t / 8.0))
-            yy = int(lerp(y0, y1, t / 8.0))
-            cv.set(xx, yy, 70, 74, 80)
-    # pointer at "extra toasted"
-    a = math.radians(315)
-    for t in range(1, 27):
-        xx = 360 + int(t * math.cos(a))
-        yy = 690 + int(t * math.sin(a))
-        cv.set(xx, yy, 176, 84, 24)
-        cv.set(xx + 1, yy, 176, 84, 24)
-    disc(cv, 360, 690, 6, (70, 74, 80), 255)
-
-    # --- side lever (right)
-    vgrad_rrect(cv, 774, 540, 800, 566, 10,
-                [(0.0, (60, 62, 66)), (1.0, (28, 30, 33))])
-    disc(cv, 800, 553, 9, (40, 42, 46), 255)
-
-    # --- the ONE accessory: a butter knife lying on the floor, right side
-    # blade: metallic parallelogram, handle: dark wood
-    blade = [(0.0, (226, 230, 234)), (0.5, (196, 201, 206)),
-             (1.0, (168, 174, 180))]
-    for yy in range(852, 884):
-        t = (yy - 852) / 32.0
-        x0 = int(742 + 16 * t)
-        x1 = int(906 + 16 * t)
-        cr, cg, cb = grad(blade, t)
-        cv.fill_row(yy, x0, x1, clamp(cr), clamp(cg), clamp(cb))
-    # blade tip taper
-    for yy in range(852, 884):
-        t = (yy - 852) / 32.0
-        x1 = int(906 + 16 * t)
-        taper = int(12 * t)
-        for x in range(x1 - taper, x1):
-            cv.blend(x, yy, 240, 242, 244, 120)
-    # bright cutting edge
-    for yy in range(852, 884):
-        t = (yy - 852) / 32.0
-        x = int(742 + 16 * t)
-        cv.set(x, yy, 250, 251, 252)
-    # handle
-    vgrad_rrect(cv, 906, 848, 988, 888, 14,
-                [(0.0, (74, 50, 34)), (1.0, (46, 30, 20))])
-    disc(cv, 922, 868, 3, (200, 170, 120), 255)
-    disc(cv, 950, 868, 3, (200, 170, 120), 255)
-
-    # --- final soft contact shadow under the toaster base
-    ellipse(cv, 512, 806, 270, 16, (50, 44, 38), 60, soft=1.0)
-    return cv
+    # 12. Deterministic fine grain, photo feel.
+    for y in range(H):
+        row = y * W * 3
+        for x in range(W):
+            h = (x * 374761393 + y * 668265263 + 12345) & 0xFFFFFFFF
+            n = (((h ^ (h >> 13)) % 9) - 4)
+            i = row + x * 3
+            fb[i] = max(0, min(255, fb[i] + n))
+            fb[i + 1] = max(0, min(255, fb[i + 1] + n))
+            fb[i + 2] = max(0, min(255, fb[i + 2] + n))
 
 
-# ---------------------------------------------------------------- PNG out
-def chunk(typ, data):
-    c = struct.pack(">I", len(data)) + typ + data
-    return c + struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
-
-
-def write_png(cv, path):
+def write_png(path):
     ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
+
+    def chunk(typ, data):
+        c = struct.pack(">I", len(data)) + typ + data
+        c += struct.pack(">I", zlib.crc32(typ + data) & 0xFFFFFFFF)
+        return c
+
     raw = bytearray()
-    for row in cv.rows:
+    for y in range(H):
         raw.append(0)
-        raw += row
-    data = b"\x89PNG\r\n\x1a\n"
-    data += chunk(b"IHDR", ihdr)
-    data += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    data += chunk(b"IEND", b"")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw += fb[y * W * 3:(y + 1) * W * 3]
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+           + chunk(b"IEND", b""))
     with open(path, "wb") as f:
-        f.write(data)
-    return len(data)
+        f.write(png)
+    return len(png)
 
 
 def main():
-    cv = render()
-    n = write_png(cv, "/output/entry.png")
-    print("wrote /output/entry.png", n, "bytes")
+    render()
+    os.makedirs("/output", exist_ok=True)
+    n = write_png(OUT)
+    print("wrote %s (%d bytes)" % (OUT, n))
 
 
 if __name__ == "__main__":

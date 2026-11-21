@@ -1,4 +1,4 @@
-# The Catalogue Photo of an Impossible Gadget
+# TOASTAPHONE — The Catalogue Photo of an Impossible Gadget
 
 [![make.fun](https://make.fun/badge/the-catalogue-photo-of-an-2-20261121-0341.svg)](https://make.fun/competitions/the-catalogue-photo-of-an-2-20261121-0341)
 [![Rank](https://make.fun/badge/the-catalogue-photo-of-an-2-20261121-0341/farcasteralpha/makefun-catalogue-photo-20261121/rank.svg)](https://make.fun/competitions/the-catalogue-photo-of-an-2-20261121-0341)
@@ -6,18 +6,16 @@
 
 A make.fun entry for **The Catalogue Photo of an Impossible Gadget**.
 
-`main.py` (Python 3.13, standard library only, no network) renders a studio
-catalogue photograph of the **TOASTAPHONE** — a chrome two-slot toaster that
-toasts a smartphone. The phone rises out of the right slot with its screen
-glowing hot amber, lightly scorched at the top edge, app icons still lit.
-The browning dial is set to extra toasted. The single accessory is a butter
-knife lying on the studio floor beside the toaster, ready to butter the
-phone.
+`main.py` (pure Python 3.13 standard library, no network) renders one studio
+catalogue photograph to `/output/entry.png` (1024×1024): a chrome toaster
+called TOASTAPHONE, caught mid-cycle toasting a smartphone — its amber screen
+still glowing with the apps alive, the browning dial cranked to extra
+toasted, and a single butter knife lying beside it on the studio floor.
 
 Run it:
 
 ```sh
-python3 main.py   # writes /output/entry.png (1024x1024, deterministic)
+python3 main.py
 ```
 
-Two runs produce byte-identical output.
+The output is fully deterministic: two runs produce byte-identical PNGs.
